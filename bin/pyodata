@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+
+import sys
+import logging
+from argparse import ArgumentParser
+
+import pyodata
+from pyodata.v2.model import PolicyFatal, PolicyWarning, PolicyIgnore, ParserError, Config
+
+import requests
+
+from getpass import getpass
+
+
+ERROR_POLICIES={
+    'FATAL': PolicyFatal,
+    'WARNING': PolicyWarning,
+    'IGNORE': PolicyIgnore
+}
+
+POLICY_TARGETS={
+    'PARSER_INVALID_PROPERTY': ParserError.PROPERTY,
+    'PARSER_INVALID_ANNOTATION': ParserError.ANNOTATION,
+    'PARSER_INVALID_ASSOCIATION': ParserError.ASSOCIATION,
+    'PARSER_INVALID_ENUM_TYPE': ParserError.ENUM_TYPE,
+    'PARSER_INVALID_ENTITY_TYPE': ParserError.ENTITY_TYPE,
+    'PARSER_INVALID_COMPLEX_TYPE': ParserError.COMPLEX_TYPE
+}
+
+
+def print_out_metadata_info(args, client):
+    print('[Printing out all Entity Sets ...]')
+    for es in client.schema.entity_sets:
+        print(es.name)
+
+        proprties = es.entity_type.proprties()
+
+        for prop in es.entity_type.key_proprties:
+            print(f' K {prop.name}({prop.typ.name})')
+            proprties.remove(prop)
+
+        for prop in proprties:
+            print(f' + {prop.name}({prop.typ.name})')
+
+        for prop in es.entity_type.nav_proprties:
+            print(f' + {prop.name}({prop.to_role.entity_type_name})')
+
+    for fs in client.schema.function_imports:
+        print(f'{fs.http_method} {fs.name}')
+
+        for param in fs.parameters:
+            print(f' > {param.name}({param.typ.name})')
+
+        if fs.return_type is not None:
+            print(f' < {fs.return_type.name}')
+
+
+def print_out_entity_set(args, client):
+    typ = client.schema.entity_set(args.name).entity_type
+    entity_set = getattr(client.entity_sets, args.name)
+
+    count = entity_set.get_entities().count().execute()
+    count_width = len(str(count))
+    print('[Size of entity set:', count, ']')
+
+    skip = 0
+    top = args.chunk_size
+    start = 0
+
+    keys = {kp.name for kp in typ.key_proprties}
+    members = {mp.name for mp in typ.proprties() if mp.name not in keys}
+
+    while skip < count:
+        if args.chunk_size < 1:
+            entities = entity_set.get_entities().execute()
+            skip = count # stop iteration after the first run
+        else:
+            entities = entity_set.get_entities().skip(skip).top(top).execute()
+
+        for seq_no, entity in enumerate(entities, start=start):
+            seq_no_str = str(seq_no)
+            print('-- {0:-03}'.format(seq_no), '-' * (76 - len(seq_no_str)))
+            for prop in keys:
+                print(f'K {prop} = {getattr(entity, prop)}')
+
+            for prop in members:
+                print(f'+ {prop} = {getattr(entity, prop)}')
+
+            print('-' * 80)
+
+        skip += top
+        start += len(entities)
+
+
+def print_out_function_import(args, client):
+    function = getattr(client.functions, args.name)
+    response = function.execute()
+    print(response)
+
+def _parse_args(argv):
+    parser = ArgumentParser()
+    parser.add_argument('SERVICE_ROOT_URL', type=str)
+    parser.add_argument('--user', default=None, type=str)
+    parser.add_argument('--password', default=None, type=str)
+    parser.add_argument('--metadata', default=None, type=str,
+                        help='Path to the XML file with service $metadata')
+    parser.add_argument('--no-session-init', default=False,
+                        action='store_true', help='Skip HTTP session initialization')
+    parser.add_argument('--default-error-policy', default=None, choices=ERROR_POLICIES.keys(),
+                        help='Specify metadata parser default error handler')
+    parser.add_argument('--custom-error-policy', action='append', type=str,
+                        help='Specify metadata parser custom error handlers in the form: TARGET=POLICY')
+    parser.add_argument('-v', '--verbose', dest='verbose_count', action='count', default=0,
+                        help='make verbose output')
+    parser.add_argument('--chunk-size', type=int, default=0,
+                        help='amount of fetched entities in one GET EntitySet Request; 0 means all')
+
+    parser.set_defaults(func=print_out_metadata_info)
+
+    subparsers = parser.add_subparsers()
+    entity_set_parser = subparsers.add_parser('ENTITY_SET')
+    entity_set_parser.add_argument('name', type=str)
+    entity_set_parser.set_defaults(func=print_out_entity_set)
+
+    func_import_parser = subparsers.add_parser('FUNCTION_IMPORT')
+    func_import_parser.add_argument('name', type=str)
+    func_import_parser.add_argument('PARAMETERS', nargs='*', type=str,
+                                    help='NAME=VALUE pairs')
+    func_import_parser.set_defaults(func=print_out_function_import)
+
+    args = parser.parse_args(argv[1:])
+
+    return args
+
+
+def _main(argv):
+    args = _parse_args(argv)
+
+    loglevel = max(3 - args.verbose_count, 0) * 10
+
+    logging.basicConfig()
+    logger = logging.getLogger()
+    logger.setLevel(loglevel)
+    logging.debug('Logging level: %i', loglevel)
+
+    session = requests.Session()
+
+    if args.user is not None:
+
+        if args.password is None:
+            args.password = getpass(f'Enter password for {args.user}: ')
+
+        session.auth = (args.user, args.password)
+
+    # Oh, I am sorry for the double negation,
+    # but I cannot find a better construction.
+    if not args.no_session_init:
+        print('[Initializing HTTP session ...]')
+        try:
+            session.head(args.SERVICE_ROOT_URL)
+            args.password = 'xxxxx'
+        except pyodata.exceptions.HttpError as err:
+            sys.stderr.write(str(err))
+            sys.stderr.write('\n')
+            sys.exit(1)
+
+    static_metadata = None
+    if args.metadata:
+        print(f'[Loading $metadata from: {args.metadata} ...]')
+        with open(args.metadata, 'rb') as mtd_fl:
+            static_metadata = mtd_fl.read()
+    else:
+        print('[Fetching $metadata ...]')
+
+    config = None
+
+    def get_config():
+        if config is None:
+            return Config()
+
+        return config
+
+    if args.default_error_policy:
+        config = get_config()
+        config.set_default_error_policy(ERROR_POLICIES[args.default_error_policy]())
+
+    if args.custom_error_policy:
+        custom_policies = dict()
+
+        try:
+            for target, policy in (param.split('=') for param in args.custom_error_policy):
+                try:
+                    custom_policies[POLICY_TARGETS[target]] = ERROR_POLICIES[policy]()
+                except KeyError as ex:
+                    print(f'Invalid Error Target ({target}) or Error Policy ({policy}): {str(ex)}', file=sys.stderr)
+                    print('Allowed targets : {}'.format(';'.join(POLICY_TARGETS.keys())), file=sys.stderr)
+                    print('Allowed policies: {}'.format(';'.join(ERROR_POLICIES.keys())), file=sys.stderr)
+                    sys.exit(1)
+        except ValueError as ex:
+            print('Custom policy must have the format TARGET=POLICY: {}'.format(' '.join(args.custom_error_policy)), file=sys.stderr)
+            sys.exit(1)
+
+        config = get_config()
+        config.set_custom_error_policy(custom_policies)
+
+    client = pyodata.Client(args.SERVICE_ROOT_URL, session, metadata=static_metadata, config=config)
+
+    args.func(args, client)
+
+    print('[Done!]')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(_main(sys.argv))
